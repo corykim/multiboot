@@ -1,21 +1,25 @@
 # multiboot
 
-A tiny cross-platform CLI that triggers a **one-shot reboot into the other OS** on a Windows/Linux UEFI dual-boot machine. Run it from Windows to boot into Linux, or from Linux to boot into Windows — the machine reverts to its normal default on the following boot.
+A tiny cross-platform CLI that triggers a **one-shot reboot into any boot entry** on a UEFI multi-boot machine — from either Windows or Linux. Pick any OS/entry; the machine reverts to its normal default on the following boot.
 
 ## How it works
 
-`multiboot` runs on both OSes and uses a different mechanism in each direction, because what's reachable differs by OS:
+`multiboot list` shows every boot **target** reachable from the OS you're on, and `multiboot boot <entry>` arms a one-shot boot of it, then reboots. Targets span **two layers**:
 
-- **Windows → Linux** drives the UEFI firmware boot menu via `bcdedit`. It arms a one-shot boot of the GRUB (`ubuntu`) firmware entry with `bcdedit /set {fwbootmgr} bootsequence {GUID}`. The firmware boots GRUB once; GRUB then boots its default.
-- **Linux → Windows** uses `grub-reboot` to set GRUB's one-shot `next_entry` to the Windows menu entry (falling back to `grub-editenv`).
+- **UEFI firmware entries** — one per bootloader (e.g. `Windows Boot Manager`, `ubuntu`/GRUB). This is the cross-OS layer: the same NVRAM list is visible and settable from either OS, via `bcdedit /set {fwbootmgr} bootsequence {GUID}` on Windows or `efibootmgr --bootnext` on Linux.
+- **Inside a bootloader** — individual OSes that share one bootloader:
+  - On Windows, separate installs under one Windows Boot Manager (e.g. Win11 vs Win10), armed via `bcdedit /bootsequence`.
+  - On Linux, GRUB menu entries (os-prober nests other OSes here), armed via `grub-reboot`.
 
-It deliberately does **not** try to read/write grubenv from Windows: on a standard Ubuntu+GRUB UEFI install the EFI System Partition holds only a stub `grub.cfg` and no grubenv — the real files live on the ext4 `/boot` partition, which Windows can't read.
+A target inside a bootloader also arms the firmware layer so the right bootloader runs first. `to-linux`/`to-windows` are convenience wrappers that auto-detect the obvious target and boot it.
+
+It deliberately does **not** try to read/write grubenv from Windows: on a standard Ubuntu+GRUB UEFI install the EFI System Partition holds only a stub `grub.cfg` and no grubenv — the real files live on the ext4 `/boot` partition, which Windows can't read. From Windows you reach Linux by booting GRUB (a firmware entry); GRUB then picks the entry.
 
 ## Requirements
 
-- A UEFI dual-boot setup with **GRUB** as the Linux bootloader.
-- **Windows side:** must run as **Administrator** (to read/set firmware entries via `bcdedit`).
-- **Linux side:** `grub-reboot` available and `GRUB_DEFAULT=saved` in `/etc/default/grub` (see [GRUB configuration](#grub-configuration)). The command re-execs itself under `sudo`.
+- A UEFI multi-boot setup. GRUB is the Linux bootloader for the Linux-side GRUB-menu targets.
+- **Windows side:** must run as **Administrator** (to read/set entries via `bcdedit`).
+- **Linux side:** `efibootmgr` (firmware targets) and/or `grub-reboot` with `GRUB_DEFAULT=saved` in `/etc/default/grub` for GRUB-menu targets (see [GRUB configuration](#grub-configuration)). `boot`/`to-*` re-exec under `sudo`.
 - [uv](https://docs.astral.sh/uv/) to run or install it.
 
 ## Install
@@ -29,20 +33,22 @@ Exposes `multiboot` (the CLI) and `multiboot-tray` (an optional Windows system-t
 ## Usage
 
 ```bash
-multiboot list              # show boot entries (works on both OSes)
+multiboot list                 # show all boot targets arm-able from this OS
+multiboot boot 2               # one-shot boot target #2 (from list), then reboot
+multiboot boot ubuntu          # ...by name substring
+multiboot boot "{d7b25d8b-...}" # ...by firmware GUID
 
-# From Windows (Administrator):
-multiboot to-linux          # arm a one-shot boot to Linux, then reboot
-multiboot to-linux --entry ubuntu
+multiboot to-linux             # convenience: auto-detect + boot Linux
+multiboot to-windows           # convenience: auto-detect + boot Windows
 
-# From Linux:
-multiboot to-windows        # arm a one-shot boot to Windows, then reboot
-multiboot to-windows --entry "Windows"
+multiboot boot 2 --dry-run     # arm it but DON'T reboot (for testing)
 ```
 
-Add `--dry-run` to arm the next boot **without** rebooting. Note it still writes the boot state (firmware `bootsequence` / grubenv `next_entry`); it only skips the reboot itself. Clear a stray arming with `bcdedit /deletevalue {fwbootmgr} bootsequence` (Windows) or `grub-editenv - unset next_entry` (Linux).
+`boot` takes an entry from `multiboot list`: its **index number**, a **name substring**, or a **{GUID}**. (A bare number is always the list index, not a hex boot number.)
 
-`--entry` is auto-detected when omitted. On Windows it accepts a `{GUID}`, a list index, or a firmware-description substring; on Linux it accepts a GRUB menu entry title or index.
+Add `--dry-run` to arm the next boot **without** rebooting. It still writes the boot state — firmware `bootsequence`/`BootNext`, Windows BCD `bootsequence`, or grubenv `next_entry` — it only skips the reboot itself. Clear a stray arming with `bcdedit /deletevalue {fwbootmgr} bootsequence` (plus `{bootmgr}` for a Windows install target) on Windows, or `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` on Linux.
+
+> **Note on nested GRUB entries:** for a GRUB menu entry inside a submenu, prefer the entry **title** over the list index — GRUB numbers submenu entries as `submenu>entry`, which won't match the flat index shown by `list`.
 
 ## GRUB configuration
 
@@ -63,7 +69,21 @@ sudo update-grub
 
 With this, Windows→Linux lands on the Linux default, and Linux→Windows does a one-shot to Windows and reverts. Using `GRUB_SAVEDEFAULT=true` ("remember last selection") breaks Windows→Linux: the firmware can only get you *into* GRUB — it can't tell GRUB which entry to pick — so a remembered Windows default sends you straight back. Do **not** set `GRUB_DEFAULT=0`; that disables the `next_entry` machinery and breaks `to-windows`.
 
+## Status & testing
+
+Developed and verified on a two-target machine (one firmware `Ubuntu` entry + one `Windows 11` install), so the multi-OS paths still need testing on richer setups:
+
+| Path | Mechanism | Status |
+|------|-----------|--------|
+| Windows → Linux (firmware) | `bcdedit {fwbootmgr} bootsequence` | ✅ verified (full round trip) |
+| Windows → a Windows install | `bcdedit /bootsequence` + firmware→`{bootmgr}` | ⚠️ arming verified via `--dry-run`; not boot-tested (needs 2 Windows installs, e.g. Win11/Win10) |
+| Linux → firmware entry | `efibootmgr --bootnext` | ❔ untested (developed on Windows) |
+| Linux → GRUB menu entry | `grub-reboot` (+ best-effort `--bootnext`) | ❔ untested; requires `GRUB_DEFAULT=saved` |
+| Multi-distro (e.g. Ubuntu → Rocky) | firmware entry *or* GRUB entry | ❔ untested; mind the submenu-index caveat above |
+
+**To test a path safely:** run `multiboot boot <idx> --dry-run`, confirm the printed "Pending one-shot selection" shows the expected `BootNext`/`bootsequence`/`next_entry`, clear it (see Usage), then try a real boot.
+
 ## Project layout
 
-- `multiboot/cli.py` — all logic; behavior branches on `IS_WINDOWS` / `IS_LINUX`.
+- `multiboot/cli.py` — all logic; behavior branches on `IS_WINDOWS` / `IS_LINUX`. Targets flow through `list_targets` → `resolve_target`/`auto_detect_target` → `arm_target`.
 - `multiboot/tray.py` — optional Windows tray front-end that shells out to the CLI, elevating via `ShellExecuteW … runas`.

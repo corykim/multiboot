@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""multiboot — reboot between Windows and Linux from either OS.
+"""multiboot — one-shot reboot into any boot entry, from Windows or Linux.
 
-Windows (run as Administrator):
-  python -m multiboot list
-  python -m multiboot to-linux
-  python -m multiboot to-linux --entry ubuntu
+  multiboot list              # show every boot target this OS can arm
+  multiboot boot <idx|name>   # one-shot boot that target, then reboot
+  multiboot to-linux          # convenience: auto-detect + boot Linux
+  multiboot to-windows        # convenience: auto-detect + boot Windows
 
-Linux (run with sudo, or it re-execs itself with sudo):
-  python -m multiboot list
-  python -m multiboot to-windows
-  python -m multiboot to-windows --entry 2
+Targets span two layers: UEFI firmware entries (one per bootloader, settable
+from either OS) and, within a bootloader, Windows BCD OS loaders (Windows side)
+or GRUB menu entries (Linux side). On Windows run as Administrator; on Linux it
+re-execs itself under sudo.
 """
 
 import argparse
@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 GRUBENV_SIZE = 1024
 GRUBENV_HEADER = "# GRUB Environment Block\n"
@@ -88,13 +88,13 @@ def release_efi():
         subprocess.run(["mountvol", _efi_letter, "/d"], capture_output=True)
     _efi_letter, _we_mounted_efi = None, False
 
-# ── Windows UEFI firmware boot entries (bcdedit) ────────────────────────────
+# ── Windows UEFI firmware + BCD entries (bcdedit) ───────────────────────────
 #
 # On a normal Ubuntu+GRUB UEFI install the ESP only holds a stub grub.cfg and
 # no grubenv — the real grub.cfg/grubenv live on the ext4 /boot partition that
-# Windows can't read. So from Windows we drive the firmware boot menu instead:
-# `bcdedit /enum firmware` lists the UEFI entries (including "ubuntu"), and
-# `bcdedit /set {fwbootmgr} bootsequence {guid}` arms a one-shot boot of GRUB.
+# Windows can't read. So from Windows we drive the firmware boot menu via
+# `bcdedit /enum firmware` + `bcdedit /set {fwbootmgr} bootsequence {guid}`,
+# and individual Windows installs via `bcdedit /enum osloader` + /bootsequence.
 
 FWBOOTMGR = "{fwbootmgr}"
 
@@ -142,44 +142,47 @@ def selectable_firmware_entries(entries: list) -> list:
         out.append(e)
     return out
 
-def auto_detect_firmware(entries: list, want_linux: bool) -> Optional[dict]:
-    named = selectable_firmware_entries(entries)
-    if want_linux:
-        cands = [e for e in named if not _SKIP_RE.search(e["description"])]
-        return _best_match(cands, lambda e: e["description"])
-    cands = [e for e in named if _WIN_RE.search(e["description"])]
-    return cands[0] if cands else None
-
-def resolve_firmware_entry(entries: list, entry: str) -> Optional[dict]:
-    """Resolve a user --entry (GUID, index, or description substring)."""
-    named = selectable_firmware_entries(entries)
-    if entry.startswith("{") and entry.endswith("}"):
-        for e in entries:
-            if e["id"].lower() == entry.lower():
-                return e
-        return None
-    if entry.lstrip("-").isdigit():
-        i = int(entry)
-        return named[i] if 0 <= i < len(named) else None
-    for e in named:                           # case-insensitive substring
-        if entry.lower() in e["description"].lower():
-            return e
-    return None
+def get_bcd_osloaders() -> list:
+    """Real Windows installs under the Windows Boot Manager (skip recovery)."""
+    r = _run_bcdedit(["/enum", "osloader"])
+    if r.returncode != 0:
+        return []
+    out, cur = [], {}
+    def flush():
+        desc, dev = cur.get("description"), cur.get("device", "")
+        if cur.get("id") and desc and "ramdisk" not in dev.lower() \
+           and "recovery" not in desc.lower():
+            out.append({"id": cur["id"], "description": desc})
+    for raw in r.stdout.splitlines():
+        if not raw.strip():
+            flush(); cur.clear(); continue
+        m = re.match(r"(\S+)\s+(.*)", raw)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key == "identifier":
+            cur["id"] = val
+        elif key == "description":
+            cur["description"] = val
+        elif key == "device":
+            cur["device"] = val
+    flush()
+    return out
 
 def set_firmware_bootnext(guid: str):
     r = _run_bcdedit(["/set", FWBOOTMGR, "bootsequence", guid])
     if r.returncode != 0:
         raise RuntimeError(
-            "bcdedit failed to set one-shot boot entry.\n"
+            "bcdedit failed to set one-shot firmware boot entry.\n"
             f"  bcdedit said: {(r.stderr or r.stdout).strip()}"
         )
 
 # ── locate grubenv + grub.cfg ──────────────────────────────────────────────
 
-_DISTRO_PRIORITY = ("ubuntu", "fedora", "arch", "manjaro", "debian",
-                    "opensuse", "grub", "grub2")
+_DISTRO_PRIORITY = ("ubuntu", "fedora", "rocky", "almalinux", "arch",
+                    "manjaro", "debian", "opensuse", "grub", "grub2")
 
-def _best_match(candidates: list, key) -> Optional[Path]:
+def _best_match(candidates: list, key) -> Optional[object]:
     if not candidates:
         return None
     for name in _DISTRO_PRIORITY:
@@ -237,17 +240,29 @@ def parse_menu_entries(grub_cfg: Path) -> list:
             depth = max(0, depth - 1)
     return entries
 
+# ── Linux UEFI firmware entries (efibootmgr) ────────────────────────────────
+
+def get_efi_bootnum_entries() -> list:
+    """UEFI NVRAM boot entries via efibootmgr → [{num, name}] (Linux)."""
+    efi = shutil.which("efibootmgr")
+    if not efi:
+        return []
+    r = subprocess.run([efi], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.+)", line)
+        if m:
+            out.append({"num": m.group(1),
+                        "name": m.group(2).split("\t")[0].strip()})
+    return out
+
 _SKIP_RE = re.compile(
-    r"windows|uefi firmware|memtest|diagnostics|efi shell", re.I
+    r"windows|uefi firmware|firmware setup|memtest|diagnostics|efi shell|"
+    r"usb device|network|recovery", re.I
 )
 _WIN_RE = re.compile(r"windows", re.I)
-
-def auto_detect_entry(entries: list, want_linux: bool) -> Optional[dict]:
-    if want_linux:
-        candidates = [e for e in entries if not _SKIP_RE.search(e["name"])]
-    else:
-        candidates = [e for e in entries if _WIN_RE.search(e["name"])]
-    return candidates[0] if candidates else None
 
 # ── reboot ─────────────────────────────────────────────────────────────────
 
@@ -255,13 +270,11 @@ def do_reboot(dry_run: bool):
     if dry_run:
         print("  [dry-run] skipping reboot")
         return
-    print("Rebooting…")
+    print("Rebooting...")
     if IS_WINDOWS:
         subprocess.run(["shutdown", "/r", "/t", "0"])
     else:
         os.execvp("sudo", ["sudo", "reboot"])
-
-# ── commands ───────────────────────────────────────────────────────────────
 
 def _dump_efi(letter: str):
     """Print the EFI partition tree to help diagnose missing grubenv."""
@@ -275,97 +288,118 @@ def _dump_efi(letter: str):
         indent = "  " + "  " * (len(rel.parts) - 1)
         print(f"{indent}{p.name}{'/' if p.is_dir() else ''}")
 
+# ── boot targets (unified across layers) ─────────────────────────────────────
+#
+# A "target" is anything we can arm a one-shot boot of, independent of layer:
+#   kind="firmware" — a UEFI NVRAM boot entry (one per bootloader). Settable
+#                     from either OS. id = {GUID} (Windows) / hex num (Linux).
+#   kind="bcd"      — a Windows BCD OS loader under one Windows Boot Manager
+#                     (e.g. Win11 vs Win10). Windows only. id = {GUID}.
+#   kind="grub"     — a GRUB menu entry (os-prober can nest other OSes here).
+#                     Linux only. id = menuentry title.
 
-def cmd_list_windows(args):
-    if not windows_is_admin():
-        sys.exit("Re-run as Administrator to read the firmware boot entries.")
-    entries = get_firmware_entries()
-    named   = selectable_firmware_entries(entries)
-    linux   = auto_detect_firmware(entries, want_linux=True)
-
-    print("UEFI firmware boot entries (bcdedit /enum firmware):")
-    print(f"  {'Idx':<4}  {'Description':<32}  Identifier")
-    print("  " + "-" * 70)
-    if not named:
-        print("  (no named firmware entries found)")
-    for i, e in enumerate(named):
-        mark = " ◄ Linux" if linux and e["id"] == linux["id"] else ""
-        print(f"  {i:<4}  {e['description']:<32}  {e['id']}{mark}")
-
-    if not any(not _SKIP_RE.search(e["description"]) for e in named):
-        letter = ensure_efi_mounted()
-        try:
-            _dump_efi(letter)
-        finally:
-            release_efi()
-        print("\nNo Linux/GRUB firmware entry detected — is Ubuntu's UEFI "
-              "entry present? (See ESP contents above.)")
-
-
-def cmd_list(args):
+def list_targets() -> list:
+    """Every boot target arm-able from the *current* OS, with a unified index."""
+    targets = []
     if IS_WINDOWS:
-        return cmd_list_windows(args)
-
-    try:
-        genv = get_grubenv_path()
-    except FileNotFoundError as exc:
-        sys.exit(f"\n{exc}")
-
-    env  = parse_grubenv(genv.read_bytes())
-    next_e  = env.get("next_entry", "(default)")
-    saved_e = env.get("saved_entry")
-
-    print(f"grubenv    : {genv}")
-    print(f"next_entry : {next_e}")
-    if saved_e:
-        print(f"saved_entry: {saved_e}")
-
-    cfg = get_grubcfg_path()
-    if cfg:
-        entries = parse_menu_entries(cfg)
-        print(f"\ngrub.cfg: {cfg}")
-        print(f"  {'Idx':<4}  Entry")
-        print("  " + "-" * 56)
-        for e in entries:
-            active = " ◄" if (str(e["index"]) == str(next_e)
-                              or e["name"] == next_e) else ""
-            indent = "  " * e["depth"]
-            print(f"  {e['index']:<4}  {indent}{e['name']}{active}")
+        for e in selectable_firmware_entries(get_firmware_entries()):
+            targets.append({"kind": "firmware", "id": e["id"],
+                            "name": e["description"]})
+        for e in get_bcd_osloaders():
+            targets.append({"kind": "bcd", "id": e["id"],
+                            "name": e["description"]})
     else:
-        print("\n(grub.cfg not found — cannot list entries)")
-
-
-def cmd_to_linux(args):
-    if not IS_WINDOWS:
-        sys.exit("'to-linux' runs on Windows. On Linux use 'to-windows'.")
-    if not windows_is_admin():
-        sys.exit("Re-run as Administrator to set the firmware boot entry.")
-
-    entries = get_firmware_entries()
-
-    if args.entry is not None:
-        target = resolve_firmware_entry(entries, args.entry)
-        if target is None:
-            sys.exit(f"No firmware entry matched --entry {args.entry!r}. "
-                     "Run 'multiboot list' to see available entries.")
-    else:
-        target = auto_detect_firmware(entries, want_linux=True)
-        if target is None:
+        for e in get_efi_bootnum_entries():
+            targets.append({"kind": "firmware", "id": e["num"],
+                            "name": e["name"]})
+        cfg = get_grubcfg_path()
+        if cfg:
             try:
-                letter = ensure_efi_mounted()
-                _dump_efi(letter)
-            finally:
-                release_efi()
-            sys.exit("\nCould not auto-detect a Linux/GRUB firmware entry.\n"
-                     "Run 'multiboot list' and pass one with --entry.")
-        print(f"Auto-detected Linux entry: {target['description']} "
-              f"({target['id']})")
+                menu = parse_menu_entries(cfg)
+            except OSError:
+                menu = []
+            for e in menu:
+                targets.append({"kind": "grub", "id": e["name"],
+                                "name": e["name"], "depth": e["depth"]})
+    for i, t in enumerate(targets):
+        t["idx"] = i
+    return targets
 
-    set_firmware_bootnext(target["id"])
-    print(f"Armed one-shot boot: {target['description']} ({target['id']})")
+def resolve_target(targets: list, query: str) -> Optional[dict]:
+    """Resolve a query to a target: {GUID}, a `list` index, or name substring."""
+    if query.startswith("{") and query.endswith("}"):
+        for t in targets:
+            if t["id"].lower() == query.lower():
+                return t
+        return None
+    if query.lstrip("-").isdigit():          # a bare number = index from `list`
+        for t in targets:
+            if t["idx"] == int(query):
+                return t
+        return None
+    for t in targets:                        # case-insensitive name substring
+        if query.lower() in t["name"].lower():
+            return t
+    return None
 
-    do_reboot(args.dry_run)
+def auto_detect_target(targets: list, want_linux: bool) -> Optional[dict]:
+    """Pick the obvious Linux/Windows target, preferring firmware entries."""
+    if want_linux:
+        pool = [t for t in targets if not _SKIP_RE.search(t["name"])]
+    else:
+        pool = [t for t in targets if _WIN_RE.search(t["name"])]
+    ranked = [t for t in pool if t["kind"] == "firmware"] or pool
+    if not ranked:
+        return None
+    return _best_match(ranked, lambda t: t["name"]) if want_linux else ranked[0]
 
+# ── arming ───────────────────────────────────────────────────────────────────
+
+def _require_privileges():
+    """Admin on Windows; on Linux re-exec under sudo if not already root."""
+    if IS_WINDOWS:
+        if not windows_is_admin():
+            sys.exit("Re-run as Administrator.")
+    elif os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+
+def _run_checked(cmd: list, label: str):
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        sys.exit(f"{label} failed (rc={r.returncode}).")
+
+def arm_target(t: dict):
+    """Arm a one-shot boot of `t` using the mechanism for its kind + OS."""
+    kind, tid = t["kind"], t["id"]
+    if kind == "firmware" and IS_WINDOWS:
+        set_firmware_bootnext(tid)                       # {fwbootmgr} bootsequence
+    elif kind == "firmware":                             # Linux
+        _run_checked(["efibootmgr", "--bootnext", tid], "efibootmgr --bootnext")
+    elif kind == "bcd":                                  # Windows only
+        _run_checked(["bcdedit", "/bootsequence", tid], "bcdedit /bootsequence")
+        set_firmware_bootnext("{bootmgr}")               # firmware -> Windows BM
+        print("  (also armed firmware -> Windows Boot Manager so it runs next)")
+    elif kind == "grub":                                 # Linux only
+        warn_if_not_savedefault()
+        set_next_entry_linux(tid)                        # grub-reboot <title>
+        _maybe_arm_firmware_for_grub()
+    else:
+        sys.exit(f"Can't arm a {kind!r} target on {platform.system()}.")
+
+def _maybe_arm_firmware_for_grub():
+    """Best-effort: point UEFI BootNext at the local GRUB entry so the firmware
+    actually runs GRUB next (needed only if the firmware default isn't GRUB)."""
+    efi = shutil.which("efibootmgr")
+    if not efi:
+        return
+    cand = _best_match(
+        [e for e in get_efi_bootnum_entries() if not _SKIP_RE.search(e["name"])],
+        lambda e: e["name"])
+    if cand:
+        subprocess.run([efi, "--bootnext", cand["num"]])
+        print(f"  (also armed firmware BootNext -> {cand['name']!r})")
+
+# ── Linux grubenv / grub-reboot helpers ──────────────────────────────────────
 
 def _grub_editenv_bin() -> Optional[str]:
     return shutil.which("grub-editenv") or shutil.which("grub2-editenv")
@@ -387,43 +421,18 @@ def warn_if_not_savedefault():
         shown = repr(val) if val is not None else "unset (defaults to 0)"
         print(f"WARNING: {cfg} has GRUB_DEFAULT={shown}, not 'saved'.\n"
               "  grub-reboot sets next_entry, which GRUB only honors when "
-              "GRUB_DEFAULT=saved —\n  the next boot may ignore it. "
+              "GRUB_DEFAULT=saved --\n  the next boot may ignore it. "
               "Fix: set GRUB_DEFAULT=saved and run 'sudo update-grub'.")
 
-def detect_windows_title(fallback: str) -> str:
-    """Resolve the Windows menuentry title from grub.cfg (robust vs. index)."""
-    cfg = get_grubcfg_path()
-    if cfg:
-        e = auto_detect_entry(parse_menu_entries(cfg), want_linux=False)
-        if e:
-            print(f"Auto-detected Windows entry: {e['name']!r}")
-            return e["name"]
-    print(f"No Windows entry auto-detected; using {fallback!r}")
-    return fallback
-
-def print_grubenv():
-    """Echo current grubenv for verification (mirrors `grub-editenv list`)."""
-    editenv = _grub_editenv_bin()
-    if editenv:
-        subprocess.run([editenv, "list"])
-        return
-    try:
-        genv = get_grubenv_path()
-        print(f"grubenv ({genv}):")
-        for k, v in parse_grubenv(genv.read_bytes()).items():
-            print(f"  {k}={v}")
-    except FileNotFoundError:
-        pass
-
 def set_next_entry_linux(target: str):
-    """Arm a one-shot boot of `target` via grub-reboot, with fallbacks."""
+    """Arm a one-shot boot of GRUB menu entry `target` via grub-reboot."""
     grub_reboot = shutil.which("grub-reboot") or shutil.which("grub2-reboot")
     if grub_reboot:
         r = subprocess.run([grub_reboot, target])
         if r.returncode == 0:
             return
         print(f"{grub_reboot} failed (rc={r.returncode}); "
-              "falling back to grubenv write…")
+              "falling back to grubenv write...")
 
     genv = get_grubenv_path()
     editenv = _grub_editenv_bin()
@@ -436,68 +445,139 @@ def set_next_entry_linux(target: str):
     env["next_entry"] = target
     genv.write_bytes(build_grubenv(env))
 
-def cmd_to_windows(args):
+# ── verification / reboot ─────────────────────────────────────────────────────
+
+def show_pending_state():
+    """Echo the pending one-shot boot selection(s) for verification."""
+    print("Pending one-shot selection:")
     if IS_WINDOWS:
-        sys.exit("'to-windows' runs on Linux. On Windows use 'to-linux'.")
+        r = _run_bcdedit(["/enum", "{fwbootmgr}"])
+        hits = [ln.strip() for ln in r.stdout.splitlines()
+                if "bootsequence" in ln.lower()]
+        print("  firmware " + (hits[0] if hits else "bootsequence (none)"))
+    else:
+        editenv = _grub_editenv_bin()
+        if editenv:
+            subprocess.run([editenv, "list"])
+        efi = shutil.which("efibootmgr")
+        if efi:
+            r = subprocess.run([efi], capture_output=True, text=True)
+            bn = [ln.strip() for ln in r.stdout.splitlines()
+                  if ln.startswith("BootNext")]
+            print("  " + (bn[0] if bn else "BootNext: (none)"))
 
-    # grub-reboot, reading grub.cfg, and writing grubenv all need root.
-    if os.geteuid() != 0:
-        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+def _arm_and_reboot(t: dict, dry_run: bool):
+    print(f"Target: [{t['idx']}] {t['name']}  ({t['kind']}:{t['id']})")
+    arm_target(t)
+    print("Armed one-shot boot.")
+    show_pending_state()
+    do_reboot(dry_run)
 
-    warn_if_not_savedefault()
+# ── commands ───────────────────────────────────────────────────────────────
 
-    target = args.entry if args.entry is not None \
-        else detect_windows_title(args.default_entry)
+def cmd_list(args):
+    if IS_WINDOWS and not windows_is_admin():
+        sys.exit("Re-run as Administrator to read boot entries.")
+    targets = list_targets()
 
-    set_next_entry_linux(target)
-    print(f"Armed one-shot boot: next_entry = {target!r}")
-    print_grubenv()                                 # verify, like your manual step
+    print(f"Boot targets on {platform.system()} "
+          f"(arm with: multiboot boot <idx|name>):")
+    print(f"  {'Idx':<4} {'Kind':<9} {'Name':<34} Id")
+    print("  " + "-" * 78)
+    for t in targets:
+        indent = "  " * t.get("depth", 0)
+        print(f"  {t['idx']:<4} {t['kind']:<9} {indent}{t['name']:<34} {t['id']}")
+    if not targets:
+        print("  (no boot targets found)")
 
-    do_reboot(args.dry_run)
+    show_pending_state()
+
+    # Windows diagnostic: if nothing non-Windows showed up, dump the ESP tree.
+    if IS_WINDOWS and not any(not _SKIP_RE.search(t["name"]) for t in targets):
+        letter = ensure_efi_mounted()
+        try:
+            _dump_efi(letter)
+        finally:
+            release_efi()
+        print("\nNo non-Windows firmware entry detected — is your other OS's "
+              "UEFI entry present? (See ESP contents above.)")
+
+
+def cmd_boot(args):
+    _require_privileges()
+    targets = list_targets()
+    t = resolve_target(targets, args.entry)
+    if t is None:
+        sys.exit(f"No boot target matched {args.entry!r}. "
+                 "Run 'multiboot list' to see targets.")
+    _arm_and_reboot(t, args.dry_run)
+
+
+def cmd_to_linux(args):
+    _require_privileges()
+    t = auto_detect_target(list_targets(), want_linux=True)
+    if t is None:
+        sys.exit("Could not auto-detect a Linux target. "
+                 "Use 'multiboot boot <entry>' (see 'multiboot list').")
+    _arm_and_reboot(t, args.dry_run)
+
+
+def cmd_to_windows(args):
+    _require_privileges()
+    t = auto_detect_target(list_targets(), want_linux=False)
+    if t is None:
+        sys.exit("Could not auto-detect a Windows target. "
+                 "Use 'multiboot boot <entry>' (see 'multiboot list').")
+    _arm_and_reboot(t, args.dry_run)
 
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 def main():
+    for stream in (sys.stdout, sys.stderr):   # Windows consoles default to cp1252
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     p = argparse.ArgumentParser(
         prog="multiboot",
-        description="One-shot reboot between Windows and Linux",
+        description="One-shot reboot to any boot entry, from Windows or Linux",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  (Windows, Admin)  multiboot list\n"
-            "  (Windows, Admin)  multiboot to-linux\n"
-            "  (Windows, Admin)  multiboot to-linux --entry 0\n"
-            "  (Linux)           multiboot list\n"
-            "  (Linux)           multiboot to-windows\n"
-            "  (Linux)           multiboot to-windows --entry 2\n"
+            "  multiboot list                  # show all boot targets (this OS)\n"
+            "  multiboot boot 2                # one-shot boot target #2, then reboot\n"
+            '  multiboot boot "Windows 10"     # ...by name substring\n'
+            "  multiboot to-linux              # auto-detect + boot Linux\n"
+            "  multiboot to-windows            # auto-detect + boot Windows\n"
+            "  multiboot boot 2 --dry-run      # arm it but don't reboot\n"
         ),
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # Shared --dry-run so it works *after* the subcommand (to-linux --dry-run).
+    # Shared --dry-run so it works *after* the subcommand (boot 2 --dry-run).
     dry = argparse.ArgumentParser(add_help=False)
     dry.add_argument("--dry-run", action="store_true",
                      help="Arm the next boot but skip the actual reboot")
 
-    sub.add_parser("list", help="Show GRUB menu entries and grubenv state")
+    sub.add_parser("list", help="Show all boot targets arm-able from this OS")
 
-    p_lin = sub.add_parser("to-linux", parents=[dry],
-                            help="(Windows) Set next boot to Linux, then reboot")
-    p_lin.add_argument("--entry", metavar="GUID_IDX_OR_NAME",
-                       help="Firmware entry: {GUID}, list index, or a "
-                            "description substring (auto-detected if omitted)")
+    p_boot = sub.add_parser(
+        "boot", parents=[dry],
+        help="Arm a one-shot boot of any target (index/name/GUID), then reboot")
+    p_boot.add_argument(
+        "entry", metavar="IDX_OR_NAME",
+        help="A target from 'multiboot list': index number, name substring, "
+             "or {GUID}")
 
-    p_win = sub.add_parser("to-windows", parents=[dry],
-                            help="(Linux) Set next boot to Windows, then reboot")
-    p_win.add_argument("--entry", metavar="TITLE_OR_IDX",
-                       help="GRUB menu entry title or index, passed to "
-                            "grub-reboot (auto-detected if omitted)")
-    p_win.add_argument("--default-entry", metavar="TITLE", default="Windows",
-                       help="Fallback title when auto-detect fails "
-                            "(default: 'Windows')")
+    sub.add_parser("to-linux", parents=[dry],
+                   help="Convenience: auto-detect the Linux target and boot it")
+    sub.add_parser("to-windows", parents=[dry],
+                   help="Convenience: auto-detect the Windows target and boot it")
 
     args = p.parse_args()
-    {"list": cmd_list, "to-linux": cmd_to_linux, "to-windows": cmd_to_windows}[args.cmd](args)
+    {"list": cmd_list, "boot": cmd_boot,
+     "to-linux": cmd_to_linux, "to-windows": cmd_to_windows}[args.cmd](args)
 
 
 if __name__ == "__main__":
