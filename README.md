@@ -40,6 +40,31 @@ To add the tray later, re-run the `[tray]` command (add `--force` if uv says it'
 
 You can also skip installing entirely and run from the checkout with `uv run multiboot ...`.
 
+### Start the tray at login (Windows)
+
+The tray must run in your **interactive desktop session** (physical console or RDP) — a tray icon launched from an SSH session lands in the invisible session 0 and never appears. The simplest reliable auto-start is a shortcut in the Startup folder, which Windows launches in your session at every login.
+
+Run this once **in your interactive session** (not over SSH):
+
+```powershell
+# Create a Startup shortcut so the tray launches at each login
+$exe     = (Get-Command multiboot-tray).Source
+$startup = [Environment]::GetFolderPath('Startup')
+$lnk     = Join-Path $startup 'Multiboot Tray.lnk'
+$wsh     = New-Object -ComObject WScript.Shell
+$sc      = $wsh.CreateShortcut($lnk)
+$sc.TargetPath  = $exe
+$sc.Description = 'Multiboot system-tray switcher'
+$sc.Save()
+Start-Process $exe        # launch it now too, without waiting for a re-login
+```
+
+`multiboot-tray` is a windowless GUI launcher, so nothing but the tray icon appears (look under the taskbar's `^` overflow). To stop auto-starting, delete the shortcut:
+
+```powershell
+Remove-Item (Join-Path ([Environment]::GetFolderPath('Startup')) 'Multiboot Tray.lnk')
+```
+
 ## Usage
 
 ```bash

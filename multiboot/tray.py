@@ -6,9 +6,7 @@ Install with:  uv tool install --editable "path/to/multiboot[tray]"
 
 import ctypes
 import shutil
-import subprocess
 import sys
-from pathlib import Path
 
 try:
     import pystray
@@ -43,11 +41,12 @@ def _run_elevated(subcmd: str):
     ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, subcmd, None, 1)
 
 def _run_in_terminal(subcmd: str):
+    """Open an *elevated* PowerShell running `multiboot <subcmd>`, kept open so
+    the output is readable. `list` needs Administrator (bcdedit)."""
     exe = _multiboot_exe()
-    subprocess.Popen(
-        ["powershell", "-NoExit", "-Command", f"& '{exe}' {subcmd}"],
-        creationflags=subprocess.CREATE_NEW_CONSOLE,
-    )
+    params = f"-NoExit -Command \"& '{exe}' {subcmd}\""
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe",
+                                        params, None, 1)
 
 # ── icon ───────────────────────────────────────────────────────────────────
 
@@ -89,7 +88,7 @@ def main():
         pystray.MenuItem("Reboot → Linux",   on_to_linux),
         pystray.MenuItem("Reboot → Windows", on_to_windows),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("List GRUB entries…", on_list),
+        pystray.MenuItem("List boot targets...", on_list),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
     )
@@ -97,7 +96,7 @@ def main():
     icon = pystray.Icon(
         name  = "multiboot",
         icon  = icon_img,
-        title = "Dual Boot Switch",
+        title = "Multiboot",
         menu  = menu,
     )
     icon.run()
