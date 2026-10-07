@@ -26,7 +26,7 @@ uv run multiboot 2 --dry-run     # arm the next boot but SKIP the reboot — use
 - A boot `TARGET` takes `--dry-run`; it arms the next boot but skips the reboot. **It still mutates real boot state** (firmware `bootsequence` / BCD `bootsequence` on Windows, `BootNext` / grubenv `next_entry` on Linux) — it only skips the actual reboot. Clear a stray arming with `bcdedit /deletevalue {fwbootmgr} bootsequence` (and `{bootmgr}` for a BCD target) on Windows, or `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` on Linux.
 - On Windows everything **requires Administrator** (bcdedit); on Linux booting a target re-execs under `sudo`. The code checks/elevates and exits otherwise.
 - Output: `main()` reconfigures stdout/stderr to UTF-8 (Windows consoles default to cp1252). Still, **keep printed strings ASCII** — the rewrite dropped the `→`/`◄`/`…` glyphs that crashed the cp1252 console.
-- Install the tray app: `uv tool install --editable ".[tray]"` (exposes `multiboot-tray`).
+- Install the CLI only: `uv tool install --editable .` (no extra deps). Add the optional Windows tray with `uv tool install --editable ".[tray]"` (pulls in `pystray` + `pillow`). The `multiboot-tray` entry point is installed either way but shows a "missing dependencies" error without `[tray]`.
 
 There are no tests, linter, or formatter configured. To sanity-check changes without a reboot, prefer `--dry-run`, or syntax/logic-check pure functions directly, e.g.:
 

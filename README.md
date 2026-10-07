@@ -24,11 +24,21 @@ It deliberately does **not** try to read/write grubenv from Windows: on a standa
 
 ## Install
 
+From the repo root, pick one:
+
 ```bash
+# CLI only (no extra dependencies) -- recommended for Linux and most setups
+uv tool install --editable .
+
+# CLI + Windows system-tray icon (pulls in pystray + pillow)
 uv tool install --editable ".[tray]"
 ```
 
-Exposes `multiboot` (the CLI) and `multiboot-tray` (an optional Windows system-tray icon). Drop `[tray]` if you don't want the tray front-end.
+Both put `multiboot` (the CLI) on your PATH. The tray is an optional Windows-only front-end that shells out to the CLI; you don't need it to use `multiboot`. The `multiboot-tray` command is installed either way, but without `[tray]` it just shows a "missing dependencies" error when launched.
+
+To add the tray later, re-run the `[tray]` command (add `--force` if uv says it's already installed). To uninstall: `uv tool uninstall multiboot`.
+
+You can also skip installing entirely and run from the checkout with `uv run multiboot ...`.
 
 ## Usage
 
