@@ -1,0 +1,17 @@
+[project]
+name = "multiboot"
+version = "0.1.0"
+description = "Reboot between Windows and Linux from either OS"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+tray = ["pystray>=0.19", "pillow>=10"]
+
+[project.scripts]
+multiboot       = "multiboot.cli:main"
+multiboot-tray  = "multiboot.tray:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
