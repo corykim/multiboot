@@ -85,7 +85,7 @@ Developed and verified on a two-target machine (one firmware `Ubuntu` entry + on
 
 | Path | Mechanism | Status |
 |------|-----------|--------|
-| Windows → Linux (firmware) | `bcdedit {fwbootmgr} bootsequence` | ✅ verified (full round trip) |
+| Windows → Linux (firmware) | `bcdedit {fwbootmgr} bootsequence` | ✅ verified — full round trip via both `multiboot linux` and `multiboot 0` |
 | Windows → a Windows install | `bcdedit /bootsequence` + firmware→`{bootmgr}` | ⚠️ arming verified via `--dry-run`; not boot-tested (needs 2 Windows installs, e.g. Win11/Win10) |
 | Linux → firmware entry | `efibootmgr --bootnext` | ❔ untested (developed on Windows) |
 | Linux → GRUB menu entry | `grub-reboot` (+ best-effort `--bootnext`) | ❔ untested; requires `GRUB_DEFAULT=saved` |
