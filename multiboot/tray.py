@@ -69,24 +69,13 @@ def _make_icon(fg: str, label: str) -> Image.Image:
 # ── menu callbacks ─────────────────────────────────────────────────────────
 
 def on_to_linux(icon, item):
-    _run_elevated("to-linux")
+    _run_elevated("linux")
 
 def on_to_windows(icon, item):
-    _run_elevated("to-windows")
+    _run_elevated("windows")
 
 def on_list(icon, item):
-    _run_in_terminal("list --dry-run")
-    # Actually list doesn't need dry-run flag, but we don't want a reboot
-    # list subcommand has no reboot, so just run it normally
-    ps_cmd = (
-        f"Start-Process -Verb RunAs -FilePath '{PYTHON}' "
-        f"-ArgumentList '\"{SCRIPT}\" list' -Wait; pause"
-    )
-    subprocess.Popen(
-        ["powershell", "-NoExit", "-Command",
-         f"& '{PYTHON}' '{SCRIPT}' list"],
-        creationflags=subprocess.CREATE_NEW_CONSOLE,
-    )
+    _run_in_terminal("list")
 
 def on_quit(icon, item):
     icon.stop()

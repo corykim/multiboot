@@ -6,23 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `multiboot` is a cross-platform CLI that triggers a **one-shot reboot into any boot entry** of a multi-boot machine, from either Windows or Linux. It runs on *both* OSes, and nearly all behavior branches on which OS it is currently running on (`IS_WINDOWS` / `IS_LINUX` in `multiboot/cli.py`). When reasoning about any function, first ask which OS path it belongs to — the mechanisms differ completely.
 
-`to-linux`/`to-windows` are thin convenience wrappers that auto-detect a target and call the same machinery as the general `boot <entry>` command.
+There are no subcommands. The single positional `TARGET` is dispatched in `main()`: omitted or `list` → `cmd_list`; `linux`/`windows` → `cmd_auto` (auto-detect that OS); anything else → `cmd_boot` (resolve + arm the target). `linux`/`windows` are the only convenience shorthands and reuse the same machinery as an explicit target.
 
 ## Commands
 
 The project uses [uv](https://docs.astral.sh/uv/). There is no `python` on PATH in this environment; use `uv run`.
 
 ```bash
-uv run multiboot list            # show all boot targets arm-able from this OS
-uv run multiboot boot 2          # one-shot boot target #2 (from list), then reboot
-uv run multiboot boot ubuntu     # ...by name substring; also accepts a {GUID}
-uv run multiboot to-linux        # convenience: auto-detect + boot Linux
-uv run multiboot to-windows      # convenience: auto-detect + boot Windows
-uv run multiboot boot 2 --dry-run   # arm the next boot but SKIP the reboot — use when testing
+uv run multiboot                 # list all boot targets arm-able from this OS (default)
+uv run multiboot 2               # one-shot boot target #2 (from list), then reboot
+uv run multiboot ubuntu          # ...by name substring; also accepts a {GUID}
+uv run multiboot linux           # convenience: auto-detect + boot Linux
+uv run multiboot windows         # convenience: auto-detect + boot Windows
+uv run multiboot 2 --dry-run     # arm the next boot but SKIP the reboot — use when testing
 ```
 
-- `boot`/`to-linux`/`to-windows` take `--dry-run`; it arms the next boot but skips the reboot. **It still mutates real boot state** (firmware `bootsequence` / BCD `bootsequence` on Windows, `BootNext` / grubenv `next_entry` on Linux) — it only skips the actual reboot. Clear a stray arming with `bcdedit /deletevalue {fwbootmgr} bootsequence` (and `{bootmgr}` for a BCD target) on Windows, or `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` on Linux.
-- On Windows everything **requires Administrator** (bcdedit); on Linux `boot`/`to-*` re-exec under `sudo`. The code checks/elevates and exits otherwise.
+`list`, `linux`, and `windows` are reserved `TARGET` words; a bare number is always the list index. (A boot entry literally named one of those must be selected by index or GUID.)
+
+- A boot `TARGET` takes `--dry-run`; it arms the next boot but skips the reboot. **It still mutates real boot state** (firmware `bootsequence` / BCD `bootsequence` on Windows, `BootNext` / grubenv `next_entry` on Linux) — it only skips the actual reboot. Clear a stray arming with `bcdedit /deletevalue {fwbootmgr} bootsequence` (and `{bootmgr}` for a BCD target) on Windows, or `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` on Linux.
+- On Windows everything **requires Administrator** (bcdedit); on Linux booting a target re-execs under `sudo`. The code checks/elevates and exits otherwise.
 - Output: `main()` reconfigures stdout/stderr to UTF-8 (Windows consoles default to cp1252). Still, **keep printed strings ASCII** — the rewrite dropped the `→`/`◄`/`…` glyphs that crashed the cp1252 console.
 - Install the tray app: `uv tool install --editable ".[tray]"` (exposes `multiboot-tray`).
 
@@ -38,7 +40,7 @@ Two files under `multiboot/`: `cli.py` (all logic) and `tray.py` (optional Windo
 
 ### The unified target model
 
-Everything flows through a list of **targets** — a dict `{idx, kind, id, name}` — built by `list_targets()` for the current OS. `resolve_target()` maps a user query (list index / `{GUID}` / name substring) to one; `auto_detect_target()` picks the obvious Linux/Windows one (preferring firmware entries, then `_best_match` by distro name); `arm_target()` arms it; `_arm_and_reboot()` arms + verifies (`show_pending_state()`) + reboots. `cmd_boot` and the two `cmd_to_*` wrappers are thin shells over these.
+Everything flows through a list of **targets** — a dict `{idx, kind, id, name}` — built by `list_targets()` for the current OS. `resolve_target()` maps a user query (list index / `{GUID}` / name substring) to one; `auto_detect_target()` picks the obvious Linux/Windows one (preferring firmware entries, then `_best_match` by distro name); `arm_target()` arms it; `_arm_and_reboot()` arms + verifies (`show_pending_state()`) + reboots. `cmd_boot` (explicit target) and `cmd_auto` (the `linux`/`windows` shorthands) are thin shells over these.
 
 A target lives at one of **two layers**, and `arm_target()` dispatches on `kind`:
 
@@ -65,7 +67,7 @@ The Layer-2 kinds (`bcd`, `grub`) also arm Layer-1 so the right bootloader runs 
 GRUB_DEFAULT=saved        # keep — required by grub-reboot
 GRUB_SAVEDEFAULT=false    # do NOT "remember last selection"; it drifts the default to Windows
 ```
-then `sudo grub-set-default 0` (pin the saved default to Linux) and `sudo update-grub`. **Do not set `GRUB_DEFAULT=0`** — that drops the `next_entry` machinery and breaks `to-windows`.
+then `sudo grub-set-default 0` (pin the saved default to Linux) and `sudo update-grub`. **Do not set `GRUB_DEFAULT=0`** — that drops the `next_entry` machinery and breaks booting `grub`-kind targets.
 
 ## Current status & testing plan (as of 2026-10-07)
 
@@ -74,13 +76,13 @@ The maintainer's machine has **only two boot targets** — one firmware entry (`
 **Verified (Windows side):**
 - `list` enumerates both layers (firmware `Ubuntu` + BCD `Windows 11`).
 - Windows → Linux round trip (firmware `bootsequence` → GRUB → Ubuntu, then revert). Confirmed by the maintainer.
-- `boot "Windows 11"` / `to-windows` arm the BCD `/bootsequence` + firmware→`{bootmgr}` (verified via `--dry-run` state readback; **not** boot-tested — only one Windows install exists here).
+- `multiboot "Windows 11"` / `multiboot windows` arm the BCD `/bootsequence` + firmware→`{bootmgr}` (verified via `--dry-run` state readback; **not** boot-tested — only one Windows install exists here).
 
 **Not yet tested — needs specific hardware:**
 - **Windows → a *second* Windows** (the `bcd` path actually booting the chosen install): needs two Windows installs under one Windows Boot Manager (e.g. Win11/Win10).
-- **Entire Linux side** (we developed it on Windows): `list` via `efibootmgr` + `grub.cfg`; `firmware` targets via `efibootmgr --bootnext`; `grub` targets via `grub-reboot` + `_maybe_arm_firmware_for_grub()`; `to-linux`/`to-windows` auto-detect. Requires `GRUB_DEFAULT=saved`.
+- **Entire Linux side** (we developed it on Windows): `list` via `efibootmgr` + `grub.cfg`; `firmware` targets via `efibootmgr --bootnext`; `grub` targets via `grub-reboot` + `_maybe_arm_firmware_for_grub()`; `multiboot linux`/`windows` auto-detect. Requires `GRUB_DEFAULT=saved`.
 - **Multi-distro** (e.g. Ubuntu → Rocky): works via firmware entries if each distro has its own UEFI entry; via `grub` entries if nested under one GRUB. **Submenu caveat:** `list`'s flat index may not match `grub-reboot`'s `submenu>entry` numbering — prefer the title for nested entries.
 
-**How to test on Linux (safe):** run as root; for each target class do `multiboot boot <idx> --dry-run`, confirm the printed "Pending one-shot selection" shows the expected `BootNext` (firmware) or `next_entry` (grub), then clear with `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` before trying a real boot.
+**How to test on Linux (safe):** run as root; for each target class do `multiboot <idx> --dry-run`, confirm the printed "Pending one-shot selection" shows the expected `BootNext` (firmware) or `next_entry` (grub), then clear with `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` before trying a real boot.
 
-**Known unrelated bug:** `tray.py`'s `on_list` references undefined `PYTHON`/`SCRIPT` and passes `list --dry-run` (which `list` no longer accepts); the tray's "List" item is broken. Out of scope so far.
+`tray.py`'s menu items now shell out to `multiboot linux` / `windows` / `list` (previously the broken `to-*` calls); the tray itself is still untested.

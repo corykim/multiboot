@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """multiboot — one-shot reboot into any boot entry, from Windows or Linux.
 
-  multiboot list              # show every boot target this OS can arm
-  multiboot boot <idx|name>   # one-shot boot that target, then reboot
-  multiboot to-linux          # convenience: auto-detect + boot Linux
-  multiboot to-windows        # convenience: auto-detect + boot Windows
+  multiboot                   # list every boot target this OS can arm
+  multiboot <idx|name|{GUID}> # one-shot boot that target, then reboot
+  multiboot linux|windows     # convenience: auto-detect that OS and boot it
 
 Targets span two layers: UEFI firmware entries (one per bootloader, settable
 from either OS) and, within a bootloader, Windows BCD OS loaders (Windows side)
@@ -481,7 +480,7 @@ def cmd_list(args):
     targets = list_targets()
 
     print(f"Boot targets on {platform.system()} "
-          f"(arm with: multiboot boot <idx|name>):")
+          f"(boot one with: multiboot <idx|name>):")
     print(f"  {'Idx':<4} {'Kind':<9} {'Name':<34} Id")
     print("  " + "-" * 78)
     for t in targets:
@@ -506,28 +505,21 @@ def cmd_list(args):
 def cmd_boot(args):
     _require_privileges()
     targets = list_targets()
-    t = resolve_target(targets, args.entry)
+    t = resolve_target(targets, args.target)
     if t is None:
-        sys.exit(f"No boot target matched {args.entry!r}. "
+        sys.exit(f"No boot target matched {args.target!r}. "
                  "Run 'multiboot list' to see targets.")
     _arm_and_reboot(t, args.dry_run)
 
 
-def cmd_to_linux(args):
+def cmd_auto(args, want_linux: bool):
+    """Convenience for `multiboot linux` / `multiboot windows`: auto-detect."""
     _require_privileges()
-    t = auto_detect_target(list_targets(), want_linux=True)
+    t = auto_detect_target(list_targets(), want_linux=want_linux)
     if t is None:
-        sys.exit("Could not auto-detect a Linux target. "
-                 "Use 'multiboot boot <entry>' (see 'multiboot list').")
-    _arm_and_reboot(t, args.dry_run)
-
-
-def cmd_to_windows(args):
-    _require_privileges()
-    t = auto_detect_target(list_targets(), want_linux=False)
-    if t is None:
-        sys.exit("Could not auto-detect a Windows target. "
-                 "Use 'multiboot boot <entry>' (see 'multiboot list').")
+        os_name = "Linux" if want_linux else "Windows"
+        sys.exit(f"Could not auto-detect a {os_name} target. "
+                 "Run 'multiboot list' and pass an index or name.")
     _arm_and_reboot(t, args.dry_run)
 
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -545,39 +537,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  multiboot list                  # show all boot targets (this OS)\n"
-            "  multiboot boot 2                # one-shot boot target #2, then reboot\n"
-            '  multiboot boot "Windows 10"     # ...by name substring\n'
-            "  multiboot to-linux              # auto-detect + boot Linux\n"
-            "  multiboot to-windows            # auto-detect + boot Windows\n"
-            "  multiboot boot 2 --dry-run      # arm it but don't reboot\n"
+            "  multiboot                  # list all boot targets (default)\n"
+            "  multiboot 0                # one-shot boot target #0, then reboot\n"
+            '  multiboot "Windows 11"     # ...by name substring\n'
+            "  multiboot {d7b25d8b-...}   # ...by firmware GUID\n"
+            "  multiboot linux            # auto-detect a Linux target and boot it\n"
+            "  multiboot 0 --dry-run      # arm it but don't reboot\n"
         ),
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    # Shared --dry-run so it works *after* the subcommand (boot 2 --dry-run).
-    dry = argparse.ArgumentParser(add_help=False)
-    dry.add_argument("--dry-run", action="store_true",
-                     help="Arm the next boot but skip the actual reboot")
-
-    sub.add_parser("list", help="Show all boot targets arm-able from this OS")
-
-    p_boot = sub.add_parser(
-        "boot", parents=[dry],
-        help="Arm a one-shot boot of any target (index/name/GUID), then reboot")
-    p_boot.add_argument(
-        "entry", metavar="IDX_OR_NAME",
-        help="A target from 'multiboot list': index number, name substring, "
-             "or {GUID}")
-
-    sub.add_parser("to-linux", parents=[dry],
-                   help="Convenience: auto-detect the Linux target and boot it")
-    sub.add_parser("to-windows", parents=[dry],
-                   help="Convenience: auto-detect the Windows target and boot it")
+    p.add_argument(
+        "target", nargs="?", metavar="TARGET",
+        help="'list' (default when omitted), 'linux'/'windows' to auto-detect, "
+             "or a target to boot: index number, name substring, or {GUID} "
+             "(see 'multiboot list')")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Arm the next boot but skip the actual reboot")
 
     args = p.parse_args()
-    {"list": cmd_list, "boot": cmd_boot,
-     "to-linux": cmd_to_linux, "to-windows": cmd_to_windows}[args.cmd](args)
+    tgt = (args.target or "list").lower()
+    if tgt == "list":
+        cmd_list(args)
+    elif tgt in ("linux", "windows"):
+        cmd_auto(args, want_linux=(tgt == "linux"))
+    else:
+        cmd_boot(args)
 
 
 if __name__ == "__main__":

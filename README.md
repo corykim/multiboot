@@ -4,14 +4,14 @@ A tiny cross-platform CLI that triggers a **one-shot reboot into any boot entry*
 
 ## How it works
 
-`multiboot list` shows every boot **target** reachable from the OS you're on, and `multiboot boot <entry>` arms a one-shot boot of it, then reboots. Targets span **two layers**:
+`multiboot list` shows every boot **target** reachable from the OS you're on, and `multiboot <entry>` arms a one-shot boot of it, then reboots. Targets span **two layers**:
 
 - **UEFI firmware entries** — one per bootloader (e.g. `Windows Boot Manager`, `ubuntu`/GRUB). This is the cross-OS layer: the same NVRAM list is visible and settable from either OS, via `bcdedit /set {fwbootmgr} bootsequence {GUID}` on Windows or `efibootmgr --bootnext` on Linux.
 - **Inside a bootloader** — individual OSes that share one bootloader:
   - On Windows, separate installs under one Windows Boot Manager (e.g. Win11 vs Win10), armed via `bcdedit /bootsequence`.
   - On Linux, GRUB menu entries (os-prober nests other OSes here), armed via `grub-reboot`.
 
-A target inside a bootloader also arms the firmware layer so the right bootloader runs first. `to-linux`/`to-windows` are convenience wrappers that auto-detect the obvious target and boot it.
+A target inside a bootloader also arms the firmware layer so the right bootloader runs first. The shorthands `multiboot linux` / `multiboot windows` auto-detect the obvious target for that OS and boot it.
 
 It deliberately does **not** try to read/write grubenv from Windows: on a standard Ubuntu+GRUB UEFI install the EFI System Partition holds only a stub `grub.cfg` and no grubenv — the real files live on the ext4 `/boot` partition, which Windows can't read. From Windows you reach Linux by booting GRUB (a firmware entry); GRUB then picks the entry.
 
@@ -19,7 +19,7 @@ It deliberately does **not** try to read/write grubenv from Windows: on a standa
 
 - A UEFI multi-boot setup. GRUB is the Linux bootloader for the Linux-side GRUB-menu targets.
 - **Windows side:** must run as **Administrator** (to read/set entries via `bcdedit`).
-- **Linux side:** `efibootmgr` (firmware targets) and/or `grub-reboot` with `GRUB_DEFAULT=saved` in `/etc/default/grub` for GRUB-menu targets (see [GRUB configuration](#grub-configuration)). `boot`/`to-*` re-exec under `sudo`.
+- **Linux side:** `efibootmgr` (firmware targets) and/or `grub-reboot` with `GRUB_DEFAULT=saved` in `/etc/default/grub` for GRUB-menu targets (see [GRUB configuration](#grub-configuration)). Booting a target re-execs under `sudo`.
 - [uv](https://docs.astral.sh/uv/) to run or install it.
 
 ## Install
@@ -33,18 +33,18 @@ Exposes `multiboot` (the CLI) and `multiboot-tray` (an optional Windows system-t
 ## Usage
 
 ```bash
-multiboot list                 # show all boot targets arm-able from this OS
-multiboot boot 2               # one-shot boot target #2 (from list), then reboot
-multiboot boot ubuntu          # ...by name substring
-multiboot boot "{d7b25d8b-...}" # ...by firmware GUID
+multiboot                      # list all boot targets arm-able from this OS (default)
+multiboot 2                    # one-shot boot target #2 (from list), then reboot
+multiboot ubuntu               # ...by name substring
+multiboot "{d7b25d8b-...}"     # ...by firmware GUID
 
-multiboot to-linux             # convenience: auto-detect + boot Linux
-multiboot to-windows           # convenience: auto-detect + boot Windows
+multiboot linux                # convenience: auto-detect + boot Linux
+multiboot windows              # convenience: auto-detect + boot Windows
 
-multiboot boot 2 --dry-run     # arm it but DON'T reboot (for testing)
+multiboot 2 --dry-run          # arm it but DON'T reboot (for testing)
 ```
 
-`boot` takes an entry from `multiboot list`: its **index number**, a **name substring**, or a **{GUID}**. (A bare number is always the list index, not a hex boot number.)
+The `TARGET` argument is an entry from `multiboot list`: its **index number**, a **name substring**, or a **{GUID}**. (A bare number is always the list index, not a hex boot number.) The words `list` (the default), `linux`, and `windows` are reserved; select an entry literally named one of those by index or GUID.
 
 Add `--dry-run` to arm the next boot **without** rebooting. It still writes the boot state — firmware `bootsequence`/`BootNext`, Windows BCD `bootsequence`, or grubenv `next_entry` — it only skips the reboot itself. Clear a stray arming with `bcdedit /deletevalue {fwbootmgr} bootsequence` (plus `{bootmgr}` for a Windows install target) on Windows, or `efibootmgr --delete-bootnext` / `grub-editenv - unset next_entry` on Linux.
 
@@ -67,7 +67,7 @@ sudo grub-set-default 0   # or the exact Ubuntu menuentry title
 sudo update-grub
 ```
 
-With this, Windows→Linux lands on the Linux default, and Linux→Windows does a one-shot to Windows and reverts. Using `GRUB_SAVEDEFAULT=true` ("remember last selection") breaks Windows→Linux: the firmware can only get you *into* GRUB — it can't tell GRUB which entry to pick — so a remembered Windows default sends you straight back. Do **not** set `GRUB_DEFAULT=0`; that disables the `next_entry` machinery and breaks `to-windows`.
+With this, Windows→Linux lands on the Linux default, and Linux→Windows does a one-shot to Windows and reverts. Using `GRUB_SAVEDEFAULT=true` ("remember last selection") breaks Windows→Linux: the firmware can only get you *into* GRUB — it can't tell GRUB which entry to pick — so a remembered Windows default sends you straight back. Do **not** set `GRUB_DEFAULT=0`; that disables the `next_entry` machinery and breaks booting GRUB-menu targets.
 
 ## Status & testing
 
@@ -81,7 +81,7 @@ Developed and verified on a two-target machine (one firmware `Ubuntu` entry + on
 | Linux → GRUB menu entry | `grub-reboot` (+ best-effort `--bootnext`) | ❔ untested; requires `GRUB_DEFAULT=saved` |
 | Multi-distro (e.g. Ubuntu → Rocky) | firmware entry *or* GRUB entry | ❔ untested; mind the submenu-index caveat above |
 
-**To test a path safely:** run `multiboot boot <idx> --dry-run`, confirm the printed "Pending one-shot selection" shows the expected `BootNext`/`bootsequence`/`next_entry`, clear it (see Usage), then try a real boot.
+**To test a path safely:** run `multiboot <idx> --dry-run`, confirm the printed "Pending one-shot selection" shows the expected `BootNext`/`bootsequence`/`next_entry`, clear it (see Usage), then try a real boot.
 
 ## Project layout
 
